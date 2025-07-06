@@ -61,3 +61,16 @@ jobs:
 
     - name: Build
       run: go build -v ./...
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker image (verification only)
+      uses: docker/build-push-action@v6
+      with:
+        context: ./docker-proxy-webhook
+        file: ./docker-proxy-webhook/Dockerfile
+        push: false
+        tags: docker-proxy-webhook:ci-test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
