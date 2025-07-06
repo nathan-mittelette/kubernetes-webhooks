@@ -15,6 +15,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     
     steps:
     - name: Checkout repository
@@ -42,6 +44,7 @@ jobs:
           type=semver,pattern={{major}}
     
     - name: Build and push Docker image
+      id: build
       uses: docker/build-push-action@v6
       with:
         context: ./docker-proxy-webhook
