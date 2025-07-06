@@ -1,24 +1,10 @@
-/*
-Copyright 2018 The Kubernetes Authors.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-// Based on https://github.com/kubernetes-sigs/controller-runtime/blob/cc532575f39e8368d0f3cf6e2ad2f14590cae16f/examples/builtins/validatingwebhook.go
-
 package v1
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/prometheus/client_golang/prometheus"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
@@ -44,7 +30,7 @@ type DockerProxyMutatingWebhook struct {
 }
 
 var (
-	anchoredShortIdentifierRegexp = regexp.MustCompile("^" + reference.ShortIdentifierRegexp.String() + "$")
+	anchoredShortIdentifierRegexp = regexp.MustCompile("^[a-f0-9]{6,}$")
 
 	webhookResultCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -91,8 +77,9 @@ func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.C
 	}
 
 	if config.DomainMap != nil {
+		log.Info("Domain mapping configuration loaded", "entries", len(config.DomainMap))
 		for from, to := range config.DomainMap {
-			log.V(1).Info("Remapping entry", "from", from, "to", to)
+			log.Info("Remapping entry", "from", from, "to", to)
 		}
 	} else {
 		err = errors.New("no domain mapping entries set")
@@ -101,20 +88,21 @@ func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.C
 	}
 
 	if config.IgnoreList != nil {
+		log.Info("Ignore list configuration loaded", "entries", len(config.IgnoreList))
 		for _, ignore := range config.IgnoreList {
-			log.V(1).Info("Ignore list entry", "value", ignore)
+			log.Info("Ignore list entry", "value", ignore)
 		}
 	} else {
-		log.V(1).Info("Ignore list empty")
+		log.Info("Ignore list empty")
 	}
+
+	log.Info("Pull secret startup configuration", "pullSecretConfigured", pullSecret != "", "pullSecretName", pullSecret)
 
 	return &DockerProxyMutatingWebhook{config: config, Client: client, PullSecret: pullSecret}, nil
 }
 
-// TODO: add _validating_ webhook to catch cases where the order of operations leads to non-conforming request
-
 func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
-	log.V(1).Info("mutating pod")
+	log.Info("mutating pod", "namespace", req.Namespace, "name", req.Name, "uid", req.UID)
 
 	if req.Resource.Resource != "pods" {
 		webhookFailureCounter.WithLabelValues("invalid_resource_type", req.Namespace).Inc()
@@ -126,7 +114,14 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 
 	pod := &corev1.Pod{}
 
-	err := webhook.decoder.Decode(req, pod)
+	if webhook.decoder == nil {
+		err := errors.New("decoder not initialized")
+		webhookFailureCounter.WithLabelValues("decoder_not_initialized", req.Namespace).Inc()
+		log.Error(err, "Decoder is nil")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	err := (*webhook.decoder).Decode(req, pod)
 	if err != nil {
 		webhookFailureCounter.WithLabelValues("decode_error", req.Namespace).Inc()
 
@@ -153,17 +148,25 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
 		if newImage != container.Image {
-			log.V(1).Info("Rewriting image", "oldImage", container.Image, "newImage", newImage, "namespace", req.Namespace)
+			log.Info("Rewriting image", "oldImage", container.Image, "newImage", newImage, "namespace", req.Namespace, "containerName", container.Name)
 			container.Image = newImage
 			changed = true
 		}
 	}
 
-	if changed && webhook.PullSecret != "" {
-		pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
-			{Name: webhook.PullSecret},
+	if changed {
+		if webhook.PullSecret != "" {
+			log.Info("Adding pull secret", "pullSecret", webhook.PullSecret, "namespace", req.Namespace)
+			pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+				{Name: webhook.PullSecret},
+			}
+		} else {
+			log.Info("No pull secret configured - images rewritten without credentials", "namespace", req.Namespace)
 		}
 	}
+
+	// Always log pullSecret configuration status for transparency
+	log.Info("Pull secret configuration", "pullSecretConfigured", webhook.PullSecret != "", "pullSecretName", webhook.PullSecret, "namespace", req.Namespace)
 
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
@@ -174,9 +177,11 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	}
 
 	if changed {
+		log.Info("Pod images were rewritten", "namespace", req.Namespace, "name", req.Name)
 		webhookResultCounter.WithLabelValues("true", req.Namespace).Inc()
 		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 	} else {
+		log.Info("No pod images were rewritten", "namespace", req.Namespace, "name", req.Name)
 		webhookResultCounter.WithLabelValues("false", req.Namespace).Inc()
 		return admission.Allowed("No `image`s rewritten")
 	}
@@ -206,6 +211,7 @@ func RewriteImage(image string, namespace string, config DockerConfig) (string, 
 	}
 
 	if val, ok := config.DomainMap[domain]; ok {
+		log.Info("Domain mapped", "originalDomain", domain, "newDomain", val, "namespace", namespace)
 		newImage = val
 	}
 
@@ -220,10 +226,11 @@ func RewriteImage(image string, namespace string, config DockerConfig) (string, 
 	}
 
 	if newImage == "" {
-		log.V(1).Info("Found unmapped domain", "domain", domain)
+		log.Info("Found unmapped domain", "domain", domain, "namespace", namespace)
 		unknownDomainCounter.WithLabelValues(domain, namespace).Inc()
 		newImage = domain
 	} else {
+		log.Info("Container image will be rewritten", "domain", domain, "namespace", namespace)
 		containerRewriteCounter.WithLabelValues(domain, namespace).Inc()
 	}
 

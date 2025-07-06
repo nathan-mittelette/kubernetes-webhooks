@@ -1,80 +1,125 @@
+# Docker Proxy Webhook Makefile
 
-# Image URL to use all building/pushing image targets
-IMG ?= controller:latest
-# Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
-CRD_OPTIONS ?= "crd:trivialVersions=true"
+# Variables
+BINARY_NAME = docker-proxy-webhook
+IMG ?= ghcr.io/nathan-mittelette/kubernetes-webhooks/docker-proxy-webhook:latest
+GO_VERSION = 1.22
+COVERAGE_FILE = coverage.out
 
-# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
-ifeq (,$(shell go env GOBIN))
-GOBIN=$(shell go env GOPATH)/bin
-else
-GOBIN=$(shell go env GOBIN)
-endif
+# Default target
+.PHONY: all
+all: build
 
-all: manager
+# Build the binary
+.PHONY: build
+build: fmt vet
+	@echo "Building binary..."
+	go build -o bin/$(BINARY_NAME) main.go
 
 # Run tests
-test: generate fmt vet manifests
-	go test ./... -coverprofile cover.out
+.PHONY: test
+test: fmt vet
+	@echo "Running tests..."
+	go test ./... -race -coverprofile=$(COVERAGE_FILE)
 
-# Build manager binary
-manager: generate fmt vet
-	go build -o bin/manager main.go
+# Run tests with coverage report
+.PHONY: test-coverage
+test-coverage: test
+	@echo "Generating coverage report..."
+	go tool cover -html=$(COVERAGE_FILE) -o coverage.html
+	@echo "Coverage report generated: coverage.html"
 
-# Run against the configured Kubernetes cluster in ~/.kube/config
-run: generate fmt vet manifests
-	go run ./main.go
-
-# Install CRDs into a cluster
-install: manifests
-	kustomize build config/crd | kubectl apply -f -
-
-# Uninstall CRDs from a cluster
-uninstall: manifests
-	kustomize build config/crd | kubectl delete -f -
-
-# Deploy controller in the configured Kubernetes cluster in ~/.kube/config
-deploy: manifests
-	cd config/manager && kustomize edit set image controller=${IMG}
-	kustomize build config/default | kubectl apply -f -
-
-# Generate manifests e.g. CRD, RBAC etc.
-manifests: controller-gen
-	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-
-# Run go fmt against code
+# Format code
+.PHONY: fmt
 fmt:
+	@echo "Formatting code..."
 	go fmt ./...
 
-# Run go vet against code
+# Run go vet
+.PHONY: vet
 vet:
+	@echo "Running go vet..."
 	go vet ./...
 
-# Generate code
-generate: controller-gen
-	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+# Run the webhook locally (requires kubeconfig)
+.PHONY: run
+run: fmt vet
+	@echo "Running webhook locally..."
+	go run main.go
 
-# Build the docker image
-docker-build: test
-	docker build . -t ${IMG}
+# Build Docker image
+.PHONY: docker-build
+docker-build:
+	@echo "Building Docker image..."
+	docker build -t $(IMG) .
 
-# Push the docker image
+# Push Docker image
+.PHONY: docker-push
 docker-push:
-	docker push ${IMG}
+	@echo "Pushing Docker image..."
+	docker push $(IMG)
 
-# find or download controller-gen
-# download controller-gen if necessary
-controller-gen:
-ifeq (, $(shell which controller-gen))
-	@{ \
-	set -e ;\
-	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
-	cd $$CONTROLLER_GEN_TMP_DIR ;\
-	go mod init tmp ;\
-	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.2.5 ;\
-	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
-	}
-CONTROLLER_GEN=$(GOBIN)/controller-gen
-else
-CONTROLLER_GEN=$(shell which controller-gen)
-endif
+# Build and push Docker image
+.PHONY: docker
+docker: docker-build docker-push
+
+# Clean build artifacts
+.PHONY: clean
+clean:
+	@echo "Cleaning build artifacts..."
+	rm -rf bin/
+	rm -f $(COVERAGE_FILE)
+	rm -f coverage.html
+
+# Install dependencies
+.PHONY: deps
+deps:
+	@echo "Installing dependencies..."
+	go mod download
+	go mod tidy
+
+# Security check
+.PHONY: security
+security:
+	@echo "Running security checks..."
+	go list -json -m all | nancy sleuth
+
+# Lint code (requires golangci-lint)
+.PHONY: lint
+lint:
+	@echo "Running linter..."
+	golangci-lint run
+
+# Deploy to Kubernetes (requires kubectl and configured cluster)
+.PHONY: deploy
+deploy:
+	@echo "Deploying to Kubernetes..."
+	kubectl apply -f manifests/k8s.yaml
+
+# Remove from Kubernetes
+.PHONY: undeploy
+undeploy:
+	@echo "Removing from Kubernetes..."
+	kubectl delete -f manifests/k8s.yaml
+
+# Help
+.PHONY: help
+help:
+	@echo "Available targets:"
+	@echo "  all           - Build the binary (default)"
+	@echo "  build         - Build the binary"
+	@echo "  test          - Run tests with coverage"
+	@echo "  test-coverage - Run tests and generate HTML coverage report"
+	@echo "  fmt           - Format code"
+	@echo "  vet           - Run go vet"
+	@echo "  run           - Run webhook locally"
+	@echo "  docker-build  - Build Docker image"
+	@echo "  docker-push   - Push Docker image"
+	@echo "  docker        - Build and push Docker image"
+	@echo "  clean         - Clean build artifacts"
+	@echo "  deps          - Install and tidy dependencies"
+	@echo "  security      - Run security checks (requires nancy)"
+	@echo "  lint          - Run linter (requires golangci-lint)"
+	@echo "  deploy        - Deploy to Kubernetes"
+	@echo "  undeploy      - Remove from Kubernetes"
+	@echo "  help          - Show this help message"

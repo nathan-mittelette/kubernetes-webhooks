@@ -85,6 +85,13 @@ spec:
             - -listen-port=19443
           image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/registry/docker-proxy
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
           # Graceful shutdown hack - sleep 15 seconds to give the k8s network
           # config time to update and stop routing new requests to this pod.
           lifecycle:
@@ -195,8 +202,7 @@ webhooks:
         name: docker-proxy-webhook
         path: /mutate
         port: 443
-    # TODO: come back and add `"v1"` once this is resolved: https://github.com/kubernetes-sigs/controller-runtime/issues/1161
-    admissionReviewVersions: ["v1beta1"]
+    admissionReviewVersions: ["v1", "v1beta1"]
     sideEffects: None
     matchPolicy: Equivalent
     reinvocationPolicy: IfNeeded
