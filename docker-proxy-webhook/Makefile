@@ -3,7 +3,7 @@
 # Variables
 BINARY_NAME = docker-proxy-webhook
 IMG ?= ghcr.io/nathan-mittelette/kubernetes-webhooks/docker-proxy-webhook:latest
-GO_VERSION = 1.22
+GO_VERSION = 1.25
 COVERAGE_FILE = coverage.out
 
 # Default target
