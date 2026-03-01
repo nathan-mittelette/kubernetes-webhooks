@@ -65,6 +65,7 @@ jobs:
         context: ./docker-proxy-webhook
         file: ./docker-proxy-webhook/Dockerfile
         push: false
+        platforms: linux/amd64,linux/arm64
         tags: docker-proxy-webhook:ci-test
         cache-from: type=gha
         cache-to: type=gha,mode=max
