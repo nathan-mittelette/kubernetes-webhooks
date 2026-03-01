@@ -1,6 +1,6 @@
 module github.com/nathan-mittelette/docker-proxy-webhook
 
-go 1.25.5
+go 1.26.0
 
 require (
 	github.com/distribution/reference v0.6.0
