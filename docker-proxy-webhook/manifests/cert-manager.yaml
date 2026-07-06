@@ -1,0 +1,43 @@
+# Option A (default): TLS certificate management via cert-manager.
+# See docker-proxy-webhook/README.md, "TLS certificate management".
+#
+# Apply together with the base manifest:
+#   kubectl apply -f manifests/k8s.yaml -f manifests/cert-manager.yaml
+#
+# This Certificate produces the "docker-proxy-webhook-certificate" Secret
+# (same name/mount path the Deployment in manifests/k8s.yaml already expects,
+# in both modes). cert-manager's CA injector then fills in
+# webhooks[].clientConfig.caBundle on both webhook configurations, driven by
+# the `cert-manager.io/inject-ca-from: docker-proxy/docker-proxy-webhook-certificate`
+# annotation already present on the MutatingWebhookConfiguration and
+# ValidatingWebhookConfiguration in manifests/k8s.yaml — no further action
+# needed here. That annotation is inert (ignored) if cert-manager isn't
+# installed, which is what makes switching to manual mode (see
+# hack/generate-certs.sh) a clean, non-circular operation: just don't apply
+# this file, and run the script instead.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: docker-proxy-webhook-certificate
+  namespace: docker-proxy
+spec:
+  secretName: docker-proxy-webhook-certificate
+  duration: 8760h # 365d
+  renewBefore: 360h # 15d
+  subject:
+    organizations:
+      - nexttrucking
+  isCA: false
+  privateKey:
+    size: 2048
+    algorithm: RSA
+    encoding: PKCS1
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - docker-proxy-webhook.docker-proxy.svc
+  issuerRef:
+    name: ca-cluster-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io

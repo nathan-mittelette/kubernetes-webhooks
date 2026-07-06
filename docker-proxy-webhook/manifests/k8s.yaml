@@ -15,39 +15,46 @@ data:
     ignoreList:
     - "123456789012.dkr.ecr.us-east-1.amazonaws.com"
     domainMap:
+      # Multi-host layout: one proxy hostname per upstream registry.
       docker.io: org-name-docker-io.jfrog.io
       quay.io: org-name-quay-io.jfrog.io
       gcr.io: org-name-gcr-io.jfrog.io
       k8s.gcr.io: org-name-k8s-gcr-io.jfrog.io
-      us.gcr.io: org-name
-      docker.elastic.co: org-name-docker-elastic-co.jfrog.io
+      us.gcr.io: org-name-us-gcr-io.jfrog.io
+      # Single-host, multi-repo layout: same proxy hostname, distinct path
+      # prefix per upstream (typical Artifactory/Nexus/Harbor setup).
+      docker.elastic.co: org-name.jfrog.io/docker-elastic-co-remote
+      # Object form: per-domain pull secret, attached only when this mapping
+      # rewrote at least one container image.
+      ghcr.io:
+        target: org-name-ghcr-io.jfrog.io
+        pullSecrets:
+        - ghcr-proxy-credentials
+    # Global pull secret(s): appended whenever ANY image was rewritten.
+    pullSecrets:
+    - docker-proxy-credentials
+
+    # Automatic replication of the secrets above into every namespace this
+    # webhook operates in. Opt-in (default false); requires the RBAC in
+    # manifests/secret-replication-rbac.yaml and POD_NAMESPACE (below).
+    # secretReplication:
+    #   enabled: true
+
+    # Registry domain whitelist enforcement (validated post-rewrite). Opt-in
+    # (default false/absent = always allow, same as today). domainMap values
+    # and ignoreList entries above are auto-allowed; see
+    # "Image Domain Validation" in the README for the full reference.
+    # validation:
+    #   enabled: true
+    #   mode: enforce   # or "warn" for a dry-run rollout
+    #   allowedDomains:
+    #   - "registry.internal.example.com"
 ---
-apiVersion: cert-manager.io/v1
-kind: Certificate
+apiVersion: v1
+kind: ServiceAccount
 metadata:
-  name: docker-proxy-webhook-certificate
+  name: docker-proxy-webhook
   namespace: docker-proxy
-spec:
-  secretName: docker-proxy-webhook-certificate
-  duration: 8760h # 365d
-  renewBefore: 360h # 15d
-  subject:
-    organizations:
-      - nexttrucking
-  isCA: false
-  privateKey:
-    size: 2048
-    algorithm: RSA
-    encoding: PKCS1
-  usages:
-    - server auth
-    - client auth
-  dnsNames:
-    - docker-proxy-webhook.docker-proxy.svc
-  issuerRef:
-    name: ca-cluster-issuer
-    kind: ClusterIssuer
-    group: cert-manager.io
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -77,6 +84,7 @@ spec:
                 operator: In
                 values:
                   - docker-proxy-webhook
+      serviceAccountName: docker-proxy-webhook
       containers:
         - name: docker-proxy-webhook
           args:
@@ -85,6 +93,13 @@ spec:
             - -listen-port=19443
           image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/registry/docker-proxy
           imagePullPolicy: Always
+          env:
+            # Required only when secretReplication.enabled is true (identifies
+            # the source namespace to replicate secrets from).
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -206,6 +221,43 @@ webhooks:
     sideEffects: None
     matchPolicy: Equivalent
     reinvocationPolicy: IfNeeded
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: docker-proxy-webhook
+  namespace: docker-proxy
+  annotations:
+    cert-manager.io/inject-ca-from: docker-proxy/docker-proxy-webhook-certificate
+webhooks:
+  - name: validate.docker-proxy-webhook.nexttrucking.com
+    namespaceSelector:
+      matchExpressions:
+        - key: docker-proxy-webhook
+          operator: NotIn
+          values:
+            - disabled
+    rules:
+      - apiGroups:   [""]
+        apiVersions: ["v1"]
+        operations:  ["CREATE", "UPDATE"]   # UPDATE covers pods/ephemeralcontainers
+        resources:   ["pods", "pods/ephemeralcontainers"]
+        scope:       "*"
+    clientConfig:
+      service:
+        namespace: docker-proxy
+        name: docker-proxy-webhook
+        path: /validate
+        port: 443
+    admissionReviewVersions: ["v1", "v1beta1"]
+    sideEffects: None
+    # A security control that fails open is not a control: this blocks pod
+    # creation in non-excluded namespaces if the webhook is unreachable. See
+    # "Image Domain Validation" > "Failure policy trade-off" in the README
+    # for mitigations (namespace opt-out, anti-affinity) and how to switch
+    # this to `Ignore` for clusters that prefer availability.
+    failurePolicy: Fail
+    timeoutSeconds: 5
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor

@@ -50,6 +50,21 @@ jobs:
     - name: Run go vet
       run: go vet ./...
 
+    - name: Shellcheck hack/generate-certs.sh
+      run: shellcheck hack/generate-certs.sh
+
+    - name: Dry-run hack/generate-certs.sh (no cluster needed)
+      run: |
+        out="$(./hack/generate-certs.sh --dry-run)"
+        echo "$out"
+        echo "$out" | grep -q "DNS:docker-proxy-webhook.docker-proxy.svc" || { echo "missing expected SAN"; exit 1; }
+        echo "$out" | grep -q ": OK" || { echo "CA did not verify the server certificate"; exit 1; }
+
+    - name: Set up envtest (kube-apiserver, etcd for controllers/ integration tests)
+      run: |
+        go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+        echo "KUBEBUILDER_ASSETS=$(setup-envtest use 1.33.0 -p path)" >> "$GITHUB_ENV"
+
     - name: Run tests
       run: go test -v -race -coverprofile=coverage.out ./...
 
