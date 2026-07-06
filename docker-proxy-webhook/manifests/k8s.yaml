@@ -194,7 +194,6 @@ apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
   name: docker-proxy-webhook
-  namespace: docker-proxy
   annotations:
     cert-manager.io/inject-ca-from: docker-proxy/docker-proxy-webhook-certificate
 webhooks:
@@ -226,7 +225,6 @@ apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
   name: docker-proxy-webhook
-  namespace: docker-proxy
   annotations:
     cert-manager.io/inject-ca-from: docker-proxy/docker-proxy-webhook-certificate
 webhooks:

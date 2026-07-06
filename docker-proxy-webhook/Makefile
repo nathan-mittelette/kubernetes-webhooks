@@ -3,7 +3,7 @@
 # Variables
 BINARY_NAME = docker-proxy-webhook
 IMG ?= ghcr.io/nathan-mittelette/kubernetes-webhooks/docker-proxy-webhook:latest
-GO_VERSION = 1.26.0
+GO_VERSION = 1.26.4
 COVERAGE_FILE = coverage.out
 ENVTEST_K8S_VERSION = 1.33.0
 LOCALBIN ?= $(shell pwd)/bin

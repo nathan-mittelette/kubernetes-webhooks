@@ -137,7 +137,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo >&2
   echo "Would run:" >&2
   echo "  kubectl create secret tls ${SECRET_NAME} --cert=<tls.crt> --key=<tls.key> -n ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -" >&2
-  echo "  kubectl patch mutatingwebhookconfiguration ${SERVICE} --type=json -p='[{\"op\":\"replace\",\"path\":\"/webhooks/<i>/clientConfig/caBundle\",\"value\":\"<base64 CA>\"}]' (one op per entry in .webhooks)" >&2
+  echo "  kubectl patch mutatingwebhookconfiguration ${SERVICE} --type=json -p='[{\"op\":\"add\",\"path\":\"/webhooks/<i>/clientConfig/caBundle\",\"value\":\"<base64 CA>\"}]' (one op per entry in .webhooks)" >&2
   echo "  kubectl patch validatingwebhookconfiguration ${SERVICE} --type=json -p='[...]' (same, skipped if the resource doesn't exist)" >&2
   exit 0
 fi
@@ -167,7 +167,7 @@ patch_webhook_cabundle() {
   i=0
   while [ "$i" -lt "$webhook_count" ]; do
     [ "$i" -gt 0 ] && patch="${patch},"
-    patch="${patch}{\"op\":\"replace\",\"path\":\"/webhooks/${i}/clientConfig/caBundle\",\"value\":\"${CA_BUNDLE}\"}"
+    patch="${patch}{\"op\":\"add\",\"path\":\"/webhooks/${i}/clientConfig/caBundle\",\"value\":\"${CA_BUNDLE}\"}"
     i=$((i + 1))
   done
   patch="${patch}]"
