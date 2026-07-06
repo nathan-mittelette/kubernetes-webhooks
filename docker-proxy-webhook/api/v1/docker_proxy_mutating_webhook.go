@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/distribution/reference"
 	"github.com/prometheus/client_golang/prometheus"
 	"gopkg.in/yaml.v2"
@@ -14,19 +15,20 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	"sort"
 	"strings"
 )
-
-type DockerConfig struct {
-	IgnoreList []string          `yaml:"ignoreList"`
-	DomainMap  map[string]string `yaml:"domainMap"`
-}
 
 type DockerProxyMutatingWebhook struct {
 	Client     client.Client
 	PullSecret string
 	decoder    *admission.Decoder
 	config     DockerConfig
+	// domainMapping is the resolved, validated domainMap/ignoreList.
+	domainMapping ResolvedDomainMapping
+	// globalPullSecrets is the effective global secret list, after applying
+	// legacy-flag/config precedence (see resolveGlobalPullSecrets).
+	globalPullSecrets []string
 }
 
 var (
@@ -59,13 +61,20 @@ var (
 			Help: "Number of unmapped domains",
 		},
 		[]string{"domain", "request_namespace"})
+	pullSecretsAddedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "docker_proxy_mutating_webhook_pull_secrets_added_total",
+			Help: "Number of imagePullSecrets entries appended to pods",
+		},
+		[]string{"secret_name", "request_namespace"},
+	)
 )
 
 // log is for logging in this package.
 var log = logf.Log.WithName("docker-proxy-mutating-webhook")
 
 func init() {
-	metrics.Registry.MustRegister(webhookResultCounter, webhookFailureCounter, containerRewriteCounter, unknownDomainCounter)
+	metrics.Registry.MustRegister(webhookResultCounter, webhookFailureCounter, containerRewriteCounter, unknownDomainCounter, pullSecretsAddedCounter)
 }
 
 func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.Client, pullSecret string) (*DockerProxyMutatingWebhook, error) {
@@ -76,16 +85,12 @@ func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.C
 		return nil, err
 	}
 
-	if config.DomainMap != nil {
-		log.Info("Domain mapping configuration loaded", "entries", len(config.DomainMap))
-		for from, to := range config.DomainMap {
-			log.Info("Remapping entry", "from", from, "to", to)
-		}
-	} else {
+	if config.DomainMap == nil {
 		err = errors.New("no domain mapping entries set")
 		log.Error(err, "Invalid config.")
 		return nil, err
 	}
+	log.Info("Domain mapping configuration loaded", "entries", len(config.DomainMap))
 
 	if config.IgnoreList != nil {
 		log.Info("Ignore list configuration loaded", "entries", len(config.IgnoreList))
@@ -96,9 +101,46 @@ func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.C
 		log.Info("Ignore list empty")
 	}
 
-	log.Info("Pull secret startup configuration", "pullSecretConfigured", pullSecret != "", "pullSecretName", pullSecret)
+	domainMapping, err := config.resolve()
+	if err != nil {
+		log.Error(err, "Invalid domain mapping configuration.")
+		return nil, err
+	}
 
-	return &DockerProxyMutatingWebhook{config: config, Client: client, PullSecret: pullSecret}, nil
+	globalPullSecrets, flagIgnored := resolveGlobalPullSecrets(pullSecret, config.PullSecrets)
+	if err := validateSecretNames(globalPullSecrets); err != nil {
+		err = fmt.Errorf("pullSecrets: %w", err)
+		log.Error(err, "Invalid pull secret configuration.")
+		return nil, err
+	}
+	if flagIgnored {
+		log.Info("Both -pull-secret flag and config-level pullSecrets are set; config takes precedence", "ignoredFlagValue", pullSecret)
+	}
+	log.Info("Effective global pull secrets", "secrets", globalPullSecrets)
+
+	return &DockerProxyMutatingWebhook{
+		config:            config,
+		domainMapping:     domainMapping,
+		globalPullSecrets: globalPullSecrets,
+		Client:            client,
+		PullSecret:        pullSecret,
+	}, nil
+}
+
+// ResolveSecretReplication resolves the loaded config's secretReplication
+// section (see api/v1/config.go), reusing the already-parsed domain mapping
+// and effective global pull secrets so the derived-secrets default reflects
+// exactly what this webhook may attach to a pod.
+func (webhook *DockerProxyMutatingWebhook) ResolveSecretReplication() (SecretReplicationSettings, error) {
+	return webhook.config.resolveSecretReplication(webhook.globalPullSecrets, webhook.domainMapping)
+}
+
+// ResolveValidation resolves the loaded config's validation section (see
+// api/v1/config.go), reusing the already-parsed domain mapping so
+// autoAllowConfiguredDomains reflects exactly the domains this webhook maps
+// or ignores — consistent domain matching between mutation and validation.
+func (webhook *DockerProxyMutatingWebhook) ResolveValidation() (ResolvedValidation, error) {
+	return webhook.config.resolveValidation(webhook.domainMapping)
 }
 
 func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
@@ -130,6 +172,7 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	}
 
 	changed := false
+	usedDomains := map[string]struct{}{}
 
 	var containers []*corev1.Container
 	for i := 0; i < len(pod.Spec.Containers); i++ {
@@ -140,7 +183,7 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	}
 
 	for _, container := range containers {
-		newImage, err := RewriteImage(container.Image, req.Namespace, webhook.config)
+		newImage, usedDomain, err := RewriteImage(container.Image, req.Namespace, webhook.domainMapping)
 		if err != nil {
 			webhookFailureCounter.WithLabelValues("rewrite_failed", req.Namespace).Inc()
 
@@ -152,21 +195,19 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 			container.Image = newImage
 			changed = true
 		}
-	}
-
-	if changed {
-		if webhook.PullSecret != "" {
-			log.Info("Adding pull secret", "pullSecret", webhook.PullSecret, "namespace", req.Namespace)
-			pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
-				{Name: webhook.PullSecret},
-			}
-		} else {
-			log.Info("No pull secret configured - images rewritten without credentials", "namespace", req.Namespace)
+		if usedDomain != "" {
+			usedDomains[usedDomain] = struct{}{}
 		}
 	}
 
-	// Always log pullSecret configuration status for transparency
-	log.Info("Pull secret configuration", "pullSecretConfigured", webhook.PullSecret != "", "pullSecretName", webhook.PullSecret, "namespace", req.Namespace)
+	if changed {
+		secretsToAttach := webhook.pullSecretsFor(usedDomains)
+		appended := appendPullSecrets(pod, secretsToAttach)
+		for _, name := range appended {
+			pullSecretsAddedCounter.WithLabelValues(name, req.Namespace).Inc()
+		}
+		log.Info("Pull secrets evaluated", "attached", appended, "existingPreserved", true, "namespace", req.Namespace)
+	}
 
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
@@ -187,54 +228,55 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	}
 }
 
-func RewriteImage(image string, namespace string, config DockerConfig) (string, error) {
+// RewriteImage rewrites image according to mapping. The returned usedDomain
+// is the domainMap source domain that was actually applied ("" if the image
+// was already conforming, ignored, or unmapped) — callers use it to decide
+// which per-domain pull secrets to attach, since secrets follow rewrites.
+func RewriteImage(image string, namespace string, mapping ResolvedDomainMapping) (newImage string, usedDomain string, err error) {
 	if anchoredShortIdentifierRegexp.MatchString(image) {
 		// Do not process "identifiers"
-		return image, nil
+		return image, "", nil
 	}
 
 	named, err := reference.ParseNormalizedNamed(image)
 	if err != nil {
 		log.Error(err, "unable to parse image", "image", image)
-		return "", err
+		return "", "", err
 	}
 
-	newImage := ""
 	domain := strings.ToLower(reference.Domain(named))
+	path := reference.Path(named)
 
-	// Check if the domain matches a mapped domain value.
-	// If so, it's already conforming & valid and does not need rewriting.
-	for _, val := range config.DomainMap {
-		if val == domain {
-			return image, nil
+	// Already-conforming check: the image is already pointed at one of the
+	// configured targets (and, if that target has a path prefix, the image
+	// path is already under it) — return unchanged without touching any
+	// metric. This makes rewriting idempotent, including under
+	// reinvocationPolicy: IfNeeded.
+	for _, target := range mapping.Targets {
+		if target.Domain != domain {
+			continue
+		}
+		if target.PathPrefix == "" || strings.HasPrefix(path, target.PathPrefix+"/") {
+			return image, "", nil
 		}
 	}
 
-	if val, ok := config.DomainMap[domain]; ok {
-		log.Info("Domain mapped", "originalDomain", domain, "newDomain", val, "namespace", namespace)
-		newImage = val
-	}
-
-	// Note: behaviour is unspecified if the domain appears in both the `DomainMap` and `IgnoreList`
-	if config.IgnoreList != nil {
-		for _, ignore := range config.IgnoreList {
-			if domain == ignore {
-				newImage = domain
-				break
-			}
-		}
-	}
-
-	if newImage == "" {
+	var newDomain string
+	if _, ignored := mapping.IgnoreList[domain]; ignored {
+		// ignoreList takes precedence over domainMap on overlap.
+		newDomain = domain
+	} else if target, ok := mapping.Targets[domain]; ok {
+		log.Info("Domain mapped", "originalDomain", domain, "newDomain", target.Domain, "newPathPrefix", target.PathPrefix, "namespace", namespace)
+		newDomain = target.String()
+		usedDomain = domain
+		containerRewriteCounter.WithLabelValues(domain, namespace).Inc()
+	} else {
 		log.Info("Found unmapped domain", "domain", domain, "namespace", namespace)
 		unknownDomainCounter.WithLabelValues(domain, namespace).Inc()
-		newImage = domain
-	} else {
-		log.Info("Container image will be rewritten", "domain", domain, "namespace", namespace)
-		containerRewriteCounter.WithLabelValues(domain, namespace).Inc()
+		newDomain = domain
 	}
 
-	newImage += "/" + reference.Path(named)
+	newImage = newDomain + "/" + path
 
 	if t, ok := named.(reference.Tagged); ok {
 		newImage += ":" + t.Tag()
@@ -244,7 +286,62 @@ func RewriteImage(image string, namespace string, config DockerConfig) (string, 
 		newImage += "@" + d.Digest().String()
 	}
 
-	return newImage, nil
+	return newImage, usedDomain, nil
+}
+
+// pullSecretsFor computes the deduplicated, deterministically ordered list of
+// secrets to attach: global secrets first, then the secrets of every
+// domainMap entry in usedDomains (sorted by source domain).
+func (webhook *DockerProxyMutatingWebhook) pullSecretsFor(usedDomains map[string]struct{}) []string {
+	seen := make(map[string]struct{})
+	var result []string
+
+	appendUnseen := func(name string) {
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		result = append(result, name)
+	}
+
+	for _, name := range webhook.globalPullSecrets {
+		appendUnseen(name)
+	}
+
+	domains := make([]string, 0, len(usedDomains))
+	for domain := range usedDomains {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+
+	for _, domain := range domains {
+		for _, name := range webhook.domainMapping.Targets[domain].PullSecrets {
+			appendUnseen(name)
+		}
+	}
+
+	return result
+}
+
+// appendPullSecrets appends secrets to pod.Spec.ImagePullSecrets, preserving
+// any existing entries (in their original position) and skipping names
+// already present. It returns the names that were actually appended.
+func appendPullSecrets(pod *corev1.Pod, secrets []string) []string {
+	existing := make(map[string]struct{}, len(pod.Spec.ImagePullSecrets))
+	for _, s := range pod.Spec.ImagePullSecrets {
+		existing[s.Name] = struct{}{}
+	}
+
+	var appended []string
+	for _, name := range secrets {
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: name})
+		existing[name] = struct{}{}
+		appended = append(appended, name)
+	}
+	return appended
 }
 
 func (webhook *DockerProxyMutatingWebhook) InjectDecoder(decoder *admission.Decoder) error {

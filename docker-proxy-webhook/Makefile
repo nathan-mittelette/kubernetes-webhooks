@@ -3,8 +3,11 @@
 # Variables
 BINARY_NAME = docker-proxy-webhook
 IMG ?= ghcr.io/nathan-mittelette/kubernetes-webhooks/docker-proxy-webhook:latest
-GO_VERSION = 1.26.0
+GO_VERSION = 1.26.4
 COVERAGE_FILE = coverage.out
+ENVTEST_K8S_VERSION = 1.33.0
+LOCALBIN ?= $(shell pwd)/bin
+ENVTEST ?= $(LOCALBIN)/setup-envtest
 
 # Default target
 .PHONY: all
@@ -28,6 +31,21 @@ test-coverage: test
 	@echo "Generating coverage report..."
 	go tool cover -html=$(COVERAGE_FILE) -o coverage.html
 	@echo "Coverage report generated: coverage.html"
+
+# Download setup-envtest and the envtest binaries (kube-apiserver, etcd) used
+# by the controllers/ package's real-API-server integration tests. Without
+# this, those tests self-skip (see controllers/secret_replication_controller_test.go).
+.PHONY: envtest
+envtest:
+	@mkdir -p $(LOCALBIN)
+	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+
+# Run the full test suite, including the controllers/ envtest-based
+# integration tests, against a real (ephemeral) API server + etcd.
+.PHONY: test-envtest
+test-envtest: envtest
+	@echo "Running tests (including envtest integration tests)..."
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test ./... -race -coverprofile=$(COVERAGE_FILE)
 
 # Format code
 .PHONY: fmt
@@ -90,11 +108,27 @@ lint:
 	@echo "Running linter..."
 	golangci-lint run
 
-# Deploy to Kubernetes (requires kubectl and configured cluster)
+# Deploy the base manifest (requires kubectl and configured cluster).
+# TLS is NOT provisioned by this target alone: follow up with either
+# `make deploy-cert-manager` (default, recommended) or `make manual-certs`.
 .PHONY: deploy
 deploy:
 	@echo "Deploying to Kubernetes..."
 	kubectl apply -f manifests/k8s.yaml
+
+# Deploy the base manifest plus cert-manager-managed TLS (option A, default).
+.PHONY: deploy-cert-manager
+deploy-cert-manager: deploy
+	@echo "Deploying cert-manager Certificate..."
+	kubectl apply -f manifests/cert-manager.yaml
+
+# Generate and install a manual, non-cert-manager TLS certificate (option B).
+# Pass extra flags via CERT_ARGS, e.g.:
+#   make manual-certs CERT_ARGS="-n docker-proxy --dry-run"
+.PHONY: manual-certs
+manual-certs:
+	@echo "Generating manual TLS certificate..."
+	./hack/generate-certs.sh $(CERT_ARGS)
 
 # Remove from Kubernetes
 .PHONY: undeploy
@@ -110,6 +144,8 @@ help:
 	@echo "  build         - Build the binary"
 	@echo "  test          - Run tests with coverage"
 	@echo "  test-coverage - Run tests and generate HTML coverage report"
+	@echo "  envtest       - Download setup-envtest (kube-apiserver, etcd test binaries)"
+	@echo "  test-envtest  - Run the full test suite incl. controllers/ envtest integration tests"
 	@echo "  fmt           - Format code"
 	@echo "  vet           - Run go vet"
 	@echo "  run           - Run webhook locally"
@@ -120,6 +156,8 @@ help:
 	@echo "  deps          - Install and tidy dependencies"
 	@echo "  security      - Run security checks (requires nancy)"
 	@echo "  lint          - Run linter (requires golangci-lint)"
-	@echo "  deploy        - Deploy to Kubernetes"
+	@echo "  deploy        - Deploy the base manifest to Kubernetes (no TLS provisioning)"
+	@echo "  deploy-cert-manager - Deploy base manifest + cert-manager Certificate (default TLS mode)"
+	@echo "  manual-certs  - Generate and install a manual TLS certificate (no cert-manager)"
 	@echo "  undeploy      - Remove from Kubernetes"
 	@echo "  help          - Show this help message"
