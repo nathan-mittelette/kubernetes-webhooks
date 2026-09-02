@@ -7,7 +7,7 @@ require (
 	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/prometheus/client_golang v1.24.1
 	gopkg.in/yaml.v2 v2.4.0
-	k8s.io/api v0.36.2
+	k8s.io/api v0.36.3
 	k8s.io/apimachinery v0.36.3
 	k8s.io/client-go v0.36.2
 	sigs.k8s.io/controller-runtime v0.24.1
